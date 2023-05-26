@@ -32,6 +32,7 @@ MODULES= \
 	compile_SUITE \
 	compilation_SUITE \
 	core_SUITE \
+	core_scan_SUITE \
 	error_SUITE \
 	float_SUITE \
 	fun_SUITE \
@@ -270,7 +271,7 @@ docs:
 
 # ----------------------------------------------------
 # Release Target
-# ---------------------------------------------------- 
+# ----------------------------------------------------
 include $(ERL_TOP)/make/otp_release_targets.mk
 
 release_spec: opt

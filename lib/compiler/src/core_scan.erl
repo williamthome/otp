@@ -1,8 +1,8 @@
 %%
 %% %CopyrightBegin%
-%% 
+%%
 %% Copyright Ericsson AB 2000-2023. All Rights Reserved.
-%% 
+%%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
 %% You may obtain a copy of the License at
@@ -14,7 +14,7 @@
 %% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
-%% 
+%%
 %% %CopyrightEnd%
 %%
 %% Purpose: Scanner for Core Erlang.
@@ -122,6 +122,41 @@ format_error(char) -> "unterminated character";
 format_error(scan) -> "premature end";
 format_error({base,Base}) -> io_lib:fwrite("illegal base '~w'", [Base]);
 format_error(float) -> "bad float";
+format_error({heredoc,syntax}) ->
+    % Elixir's example of this error:
+    % iex(1)> """foo
+    % ** (SyntaxError) iex:1:1: heredoc allows only zero or more whitespace characters followed by a new line after """
+    %   |
+    % 1 | """foo
+    %   | ^
+    "heredoc allows only zero or more whitespace characters followed by a new line after \"\"\"";
+format_error({heredoc,outdented}) ->
+    % Elixir's shows a warning instead of an error:
+    % iex(1)>   """
+    % ...(1)> foo
+    % ...(1)>   """
+    % warning: outdented heredoc line. The contents inside the heredoc should be indented at the same level as the closing """. The following is forbidden:
+    %
+    %     def text do
+    %       """
+    %     contents
+    %       """
+    %     end
+    %
+    % Instead make sure the contents are indented as much as the heredoc closing:
+    %
+    %     def text do
+    %       """
+    %       contents
+    %       """
+    %     end
+    %
+    % The current heredoc line is indented too little
+    %   iex:3:3
+    %
+    % "foo\n"
+    "outdented heredoc line";
+format_error({heredoc,eof}) -> "premature heredoc end";
 format_error(Other) -> io_lib:write(Other).
 
 string_thing($') -> "atom";    %' stupid emacs
@@ -298,6 +333,22 @@ scan1([$'|Cs0], Toks, Pos) ->				%Atom (always quoted)
         error:_ ->
             scan_error({illegal,atom}, Pos)
     end;
+scan1([$",$",$",$"|Cs], Toks, Pos) ->				%Heredoc
+    Del = fun
+          ([$",$",$",$"|Dcs], Dpos) ->
+              {true, Dcs, Dpos};
+          (_, _) ->
+              false
+          end,
+    scan_heredoc(Cs, Toks, Pos, Del);
+scan1([$",$",$"|Cs], Toks, Pos) ->				%Heredoc
+    Del = fun
+          ([$",$",$"|Dcs], Dpos) ->
+              {true, Dcs, Dpos};
+          (_, _) ->
+              false
+          end,
+    scan_heredoc(Cs, Toks, Pos, Del);
 scan1([$"|Cs0], Toks, Pos) ->				%String
     {S,Cs1,Pos1} = scan_string(Cs0, $", Pos),
     scan1(Cs1, [{string,Pos,S}|Toks], Pos1);
@@ -356,6 +407,70 @@ name_char(C) when C >= $0, C =< $9 -> true;
 name_char($_) -> true;
 name_char($@) -> true;
 name_char(_) -> false.
+
+%% scan_heredoc([Char], Position, Delimiter)
+
+scan_heredoc(Cs, Toks, Pos, Del) ->
+    case trim_heredoc(Cs, Pos) of
+        {ok, Tcs, Tpos} ->
+            case scan_heredoc_1(Tcs, {indent,0}, Tpos, Del, []) of
+                {ok, Str, Ncs, Npos} ->
+                    scan1(Ncs, [{string,Pos,Str}|Toks], Npos);
+                {error, Reason} ->
+                    scan_error(Reason, Pos)
+            end;
+        {error, Reason} ->
+            scan_error(Reason, Pos)
+    end.
+
+scan_heredoc_1(Cs, {indent, _} = Indent, Pos, Del, Acc) ->
+    case Del(Cs, Pos) of
+        {true, Ncs, Npos} ->
+            case indent_heredoc(lists:reverse(Acc), Indent) of
+                {ok, Str} ->
+                    {ok, Str, Ncs, Npos};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        false ->
+            scan_heredoc_2(Cs, Indent, Pos, Del, Acc)
+    end.
+
+scan_heredoc_2([$\n|Cs], _, Pos, Del, Acc) ->
+    scan_heredoc_1(Cs, {indent, 0}, Pos+1, Del, [$\n|Acc]);
+scan_heredoc_2([32|Cs], {indent, I}, Pos, Del, Acc) ->
+    scan_heredoc_1(Cs, {indent, I+1}, Pos, Del, [32|Acc]);
+scan_heredoc_2([C|Cs], _, Pos, Del, Acc) ->
+    scan_heredoc_2(Cs, push, Pos, Del, [C|Acc]);
+scan_heredoc_2([], _, _, _, _) ->
+    {error, {heredoc,eof}}.
+
+trim_heredoc([32|Cs], Pos) ->
+    trim_heredoc(Cs, Pos);
+trim_heredoc([$\n|Cs], Pos) ->
+    {ok, Cs, Pos+1};
+trim_heredoc(_, _) ->
+    {error, {heredoc,syntax}}.
+
+indent_heredoc(Str, Indent) ->
+    indent_heredoc_1(Str, Indent, Indent, []).
+
+indent_heredoc_1([$\n|Cs], _, InitIndent, [$\\,$\\|Acc]) ->
+    indent_heredoc_1(Cs, InitIndent, InitIndent, [$\n,$\\|Acc]);
+indent_heredoc_1([$\n|Cs], _, InitIndent, [$\\|Acc]) ->
+    indent_heredoc_1(Cs, InitIndent, InitIndent, Acc);
+indent_heredoc_1([$\n|Cs], _, InitIndent, Acc) ->
+    indent_heredoc_1(Cs, InitIndent, InitIndent, [$\n|Acc]);
+indent_heredoc_1([C|Cs], {indent, 0}, InitIndent, Acc) ->
+    indent_heredoc_1(Cs, push, InitIndent, [C|Acc]);
+indent_heredoc_1([32|Cs], {indent, I}, InitIndent, Acc) ->
+    indent_heredoc_1(Cs, {indent, I-1}, InitIndent, Acc);
+indent_heredoc_1([C|Cs], push, InitIndent, Acc) ->
+    indent_heredoc_1(Cs, push, InitIndent, [C|Acc]);
+indent_heredoc_1([], _, _, Acc) ->
+    {ok, lists:reverse(Acc)};
+indent_heredoc_1(_, {indent, _}, _, _) ->
+    {error, {heredoc,outdented}}.
 
 %% scan_string(CharList, QuoteChar, Pos) -> {StringChars,RestChars,NewPos}.
 

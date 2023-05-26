@@ -127,6 +127,40 @@ format_error({illegal,Type}) ->
 format_error(char) -> "unterminated character";
 format_error({base,Base}) ->
     lists:flatten(io_lib:fwrite("illegal base '~w'", [Base]));
+format_error({heredoc,syntax}) ->
+    % Elixir's example of this error:
+    % iex(1)> """foo
+    % ** (SyntaxError) iex:1:1: heredoc allows only zero or more whitespace characters followed by a new line after """
+    %   |
+    % 1 | """foo
+    %   | ^
+    "heredoc allows only zero or more whitespace characters followed by a new line after \"\"\"";
+format_error({heredoc,outdented}) ->
+    % Elixir's shows a warning instead of an error:
+    % iex(1)>   """
+    % ...(1)> foo
+    % ...(1)>   """
+    % warning: outdented heredoc line. The contents inside the heredoc should be indented at the same level as the closing """. The following is forbidden:
+    %
+    %     def text do
+    %       """
+    %     contents
+    %       """
+    %     end
+    %
+    % Instead make sure the contents are indented as much as the heredoc closing:
+    %
+    %     def text do
+    %       """
+    %       contents
+    %       """
+    %     end
+    %
+    % The current heredoc line is indented too little
+    %   iex:3:3
+    %
+    % "foo\n"
+    "outdented heredoc line";
 format_error(Other) ->
     lists:flatten(io_lib:write(Other)).
 
@@ -425,6 +459,22 @@ scan1("."=Cs, St, Line, Col, Toks) ->
     {more,{Cs,St,Col,Toks,Line,[],fun scan/6}};
 scan1([$.=C|Cs], St, Line, Col, Toks) ->
     scan_dot(Cs, St, Line, Col, Toks, [C]);
+scan1([$",$",$",$"|Cs], St, Line, Col, Toks) ->
+    Del = fun
+          ([$",$",$",$"|Dcs], Dline, Dcol) ->
+              {true, Dcs, Dline, incr_column(Dcol, 4)};
+          (_, _, _) ->
+              false
+          end,
+    scan_heredoc(Cs, St, Line, Col, Toks, incr_column(Col, 4), Del);
+scan1([$",$",$"|Cs], St, Line, Col, Toks) ->
+    Del = fun
+          ([$",$",$"|Dcs], Dline, Dcol) ->
+              {true, Dcs, Dline, incr_column(Dcol, 3)};
+          (_, _, _) ->
+              false
+          end,
+    scan_heredoc(Cs, St, Line, Col, Toks, incr_column(Col, 3), Del);
 scan1([$"|Cs], St, Line, Col, Toks) -> %" Emacs
     State0 = {[],[],Line,Col},
     scan_string(Cs, St, Line, incr_column(Col, 1), Toks, State0);
@@ -827,6 +877,75 @@ scan_char([], St, Line, Col, Toks) ->
     {more,{[$$],St,Col,Toks,Line,[],fun scan/6}};
 scan_char(eof, _St, Line, Col, _Toks) ->
     scan_error(char, Line, Col, Line, incr_column(Col, 1), eof).
+
+scan_heredoc(Cs, #erl_scan{}=St, Line, Col, Toks, Icol, Del) ->
+    case trim_heredoc(Cs, Line, Icol) of
+        {ok, Tcs, Tline, Tcol} ->
+            scan_heredoc(Tcs, St, Tline, Tcol, Toks, {Line,Col,{indent,0},Del,[]});
+        {error, Reason, Eline, Ecol, Ecs} ->
+            scan_error(Reason, Line, Col, Eline, Ecol, Ecs)
+    end.
+
+scan_heredoc(Cs, #erl_scan{}=St, Line, Col, Toks, {Iline,Icol,Indent,Del,Acc}) ->
+    case scan_heredoc_1(Cs, Indent, Line, Col, Del, Acc) of
+        {ok, Str, Nline, Ncol, Ncs} ->
+            Anno = anno(Iline, Icol, St, ?STR(string, St, Str)),
+            scan1(Ncs, St, Nline, Ncol, [{string,Anno,Str}|Toks]);
+        {more, Str, _Nline, _Ncol, Nindent, Ncs} ->
+            {more,{Str,St,Icol,Toks,Iline+1,{Iline,Icol,Nindent,Del,Ncs},fun scan_heredoc/6}};
+        {error, Reason, Eline, Ecol, Ecs} ->
+            scan_error(Reason, Line, Col, Eline, Ecol, Ecs)
+    end.
+
+scan_heredoc_1(Cs, Indent, Line, Col, Del, Acc) ->
+    case Del(Cs, Line, Col) of
+        {true, Ncs, Nline, Ncol} ->
+            case indent_heredoc(lists:reverse(Acc), Indent) of
+                {ok, Str} ->
+                    {ok, Str, Nline, Ncol, Ncs};
+                {error, Reason} ->
+                    {error, Reason, Nline, Ncol, Ncs}
+            end;
+        false ->
+            scan_heredoc_2(Cs, Indent, Line, Col, Del, Acc)
+    end.
+
+scan_heredoc_2([$\n|Cs], _, Line, Col, Del, Acc) ->
+    scan_heredoc_1(Cs, {indent, 0}, Line+1, new_column(Col, 1), Del, [$\n|Acc]);
+scan_heredoc_2([32|Cs], {indent, I}, Line, Col, Del, Acc) ->
+    scan_heredoc_1(Cs, {indent, I+1}, Line, incr_column(Col, 1), Del, [32|Acc]);
+scan_heredoc_2([C|Cs], _, Line, Col, Del, Acc) ->
+    scan_heredoc_2(Cs, push, Line, incr_column(Col, 1), Del, [C|Acc]);
+scan_heredoc_2([]=Ncs, Indent, Line, Col, _, Acc) ->
+    Cs = lists:reverse(Acc),
+    {more,Cs,Line,Col,Indent,Ncs}.
+
+trim_heredoc([32|Cs], Line, Col) ->
+    trim_heredoc(Cs, Line, incr_column(Col, 1));
+trim_heredoc([$\n|Cs], Line, Col) ->
+    {ok, Cs, Line+1, new_column(Col, 1)};
+trim_heredoc(Cs, Line, Col) ->
+    {error, {heredoc,syntax}, Line, Col, Cs}.
+
+indent_heredoc(Str, Indent) ->
+    indent_heredoc_1(Str, Indent, Indent, []).
+
+indent_heredoc_1([$\n|Cs], _, InitIndent, [$\\,$\\|Acc]) ->
+    indent_heredoc_1(Cs, InitIndent, InitIndent, [$\n,$\\|Acc]);
+indent_heredoc_1([$\n|Cs], _, InitIndent, [$\\|Acc]) ->
+    indent_heredoc_1(Cs, InitIndent, InitIndent, Acc);
+indent_heredoc_1([$\n|Cs], _, InitIndent, Acc) ->
+    indent_heredoc_1(Cs, InitIndent, InitIndent, [$\n|Acc]);
+indent_heredoc_1([C|Cs], {indent, 0}, InitIndent, Acc) ->
+    indent_heredoc_1(Cs, push, InitIndent, [C|Acc]);
+indent_heredoc_1([32|Cs], {indent, I}, InitIndent, Acc) ->
+    indent_heredoc_1(Cs, {indent, I-1}, InitIndent, Acc);
+indent_heredoc_1([C|Cs], push, InitIndent, Acc) ->
+    indent_heredoc_1(Cs, push, InitIndent, [C|Acc]);
+indent_heredoc_1([], _, _, Acc) ->
+    {ok, lists:reverse(Acc)};
+indent_heredoc_1(_, {indent, _}, _, _) ->
+    {error, {heredoc,outdented}}.
 
 scan_string(Cs, #erl_scan{}=St, Line, Col, Toks, {Wcs,Str,Line0,Col0}) ->
     case scan_string0(Cs, St, Line, Col, $\", Str, Wcs) of %"
