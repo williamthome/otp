@@ -158,6 +158,12 @@ value_option(Flag, Default, On, OnVal, Off, OffVal, Opts) ->
                fun_used_vars = undefined        %Funs used vars
                    :: fun_used_vars() | undefined,
                usage = #usage{}		:: #usage{},
+               nadocs = []			%Non associated Docs
+                   :: [{'doc' | 'typedoc' | 'callbackdoc' | 'recorddoc',
+                        {anno(), string() | atom() | map()}}],
+               docs = []			%Docs specifications
+                   :: [{'moduledoc' | 'doc' | 'typedoc' | 'callbackdoc' | 'recorddoc',
+                        {module() | fa() | atom(), {anno(), string() | atom() | map()}}}],
                specs = maps:new()               %Type specifications
                    :: #{mfa() => anno()},
                callbacks = maps:new()           %Callback types
@@ -316,7 +322,7 @@ format_error({too_many_arguments,Arity}) ->
 format_error(illegal_pattern) -> "illegal pattern";
 format_error(illegal_map_key) -> "illegal map key in pattern";
 format_error(illegal_expr) -> "illegal expression";
-format_error({illegal_guard_local_call, {F,A}}) -> 
+format_error({illegal_guard_local_call, {F,A}}) ->
     io_lib:format("call to local/imported function ~tw/~w is illegal in guard",
 		  [F,A]);
 format_error(illegal_guard_expr) -> "illegal guard expression";
@@ -424,6 +430,15 @@ format_error({redefine_optional_callback, {F, A}}) ->
     io_lib:format("optional callback ~tw/~w duplicated", [F, A]);
 format_error({undefined_callback, {_M, F, A}}) ->
     io_lib:format("callback ~tw/~w is undefined", [F, A]);
+%% --- docs ---
+format_error(invalid_doc_sequence) ->
+    io_lib:format("cannot define a sequence of different doc attributes", []);
+format_error(doc_already_defined) ->
+    io_lib:format("cannot define multiple strings for a doc attribute", []);
+format_error(invalid_doc_def) ->
+    io_lib:format("doc attribute erroneously defined", []);
+format_error(unbound_doc) ->
+    io_lib:format("unbound doc attribute", []);
 %% --- types and specs ---
 format_error({singleton_typevar, Name}) ->
     io_lib:format("type variable ~w is only used once (is unbound)", [Name]);
@@ -895,6 +910,12 @@ attribute_state({attribute,A,optional_callbacks,Es}, St) ->
     optional_callbacks(A, Es, St);
 attribute_state({attribute,A,on_load,Val}, St) ->
     on_load(A, Val, St);
+attribute_state({attribute,A,Attr,Doc}, St) when Attr =:= moduledoc;
+                                                 Attr =:= doc; % fundoc
+                                                 Attr =:= typedoc;
+                                                 Attr =:= callbackdoc;
+                                                 Attr =:= recorddoc ->
+    doc_def(A, Attr, Doc, St);
 attribute_state({attribute,_A,_Other,_Val}, St) -> % Ignore others
     St;
 attribute_state(Form, St) ->
@@ -916,6 +937,12 @@ function_state({attribute,A,spec,{Fun,Types}}, St) ->
     spec_decl(A, Fun, Types, St);
 function_state({attribute,_A,dialyzer,_Val}, St) ->
     St;
+function_state({attribute,A,Attr,Doc}, St) when Attr =:= moduledoc;
+                                                Attr =:= doc; % fundoc
+                                                Attr =:= typedoc;
+                                                Attr =:= callbackdoc;
+                                                Attr =:= recorddoc ->
+    doc_def(A, Attr, Doc, St);
 function_state({attribute,Aa,Attr,_Val}, St) ->
     add_error(Aa, {attribute,Attr}, St);
 function_state({function,Anno,N,A,Cs}, St) ->
@@ -995,26 +1022,40 @@ disallowed_compile_flags(Forms, St0) ->
 %% Do some further checking after the forms have been traversed and
 %% data about calls etc. have been collected.
 
+%% NOTE: Changed to foldl to a more easily way to reorder and organize.
 post_traversal_check(Forms, St0) ->
-    St1 = check_behaviour(St0),
-    St2 = check_deprecated(Forms, St1),
-    St3 = check_imports(Forms, St2),
-    St4 = check_inlines(Forms, St3),
-    St5 = check_undefined_functions(St4),
-    St6 = check_unused_functions(Forms, St5),
-    St7 = check_bif_clashes(Forms, St6),
-    St8 = check_specs_without_function(St7),
-    St9 = check_functions_without_spec(Forms, St8),
-    StA = check_undefined_types(St9),
-    StB = check_unused_types(Forms, StA),
-    StC = check_untyped_records(Forms, StB),
-    StD = check_on_load(StC),
-    StE = check_unused_records(Forms, StD),
-    StF = check_local_opaque_types(StE),
-    StG = check_dialyzer_attribute(Forms, StF),
-    StH = check_callback_information(StG),
-    StI = check_nifs(Forms, StH),
-    check_removed(Forms, StI).
+    Cbs = [
+        fun check_behaviour/1,
+        fun check_deprecated/2,
+        fun check_imports/2,
+        fun check_inlines/2,
+        fun check_undefined_functions/1,
+        fun check_unused_functions/2,
+        fun check_bif_clashes/2,
+        fun check_functions_without_spec/2,
+        fun check_specs_without_function/1,
+        fun check_undefined_types/1,
+        fun check_unused_types/2,
+        fun check_untyped_records/2,
+        fun check_on_load/1,
+        fun check_unused_records/2,
+        fun check_local_opaque_types/1,
+        fun check_dialyzer_attribute/2,
+        fun check_callback_information/1,
+        fun check_nifs/2,
+        fun check_removed/2,
+        fun check_nadocs/1
+        % TODO: Should do the same check as specs that optionally
+        %       requires all functions with docs?
+        % fun check_functions_without_doc/2
+    ],
+    Fun = fun
+          (Cb, St) when is_function(Cb, 1) ->
+              Cb(St);
+          (Cb, St) when is_function(Cb, 2) ->
+              Cb(Forms, St)
+          end,
+    lists:foldl(Fun, St0, Cbs).
 
 %% check_behaviour(State0) -> State
 %% Check that the behaviour attribute is valid.
@@ -1623,7 +1664,8 @@ call_function(Anno0, F, A, #lint{usage=Usage0,called=Cd,func=Func,file=File}=St)
 function(Anno, Name, Arity, Cs, St0) ->
     St1 = St0#lint{func={Name,Arity}},
     St2 = define_function(Anno, Name, Arity, St1),
-    clauses(Cs, St2).
+    St3 = clauses(Cs, St2),
+    flush_nadocs(doc, {Name,Arity}, St3).
 
 -spec define_function(anno(), atom(), arity(), lint_state()) -> lint_state().
 
@@ -2466,7 +2508,7 @@ expr({call,Anno,{atom,Aa,F},As}, Vt, St0) ->
     AutoSuppressed = is_autoimport_suppressed(St2#lint.no_auto,{F,A}),
     Warn = is_warn_enabled(bif_clash, St2) and (not bif_clash_specifically_disabled(St2,{F,A})),
     Imported = imported(F, A, St2),
-    case ((not IsLocal) andalso (Imported =:= no) andalso 
+    case ((not IsLocal) andalso (Imported =:= no) andalso
 	  IsAutoBif andalso (not AutoSuppressed)) of
         true ->
 	    St3 = deprecated_function(Anno, erlang, F, As, St2),
@@ -2660,14 +2702,17 @@ is_valid_call(Call) ->
 
 record_def(Anno, Name, Fs0, St0) ->
     case is_map_key(Name, St0#lint.records) of
-        true -> add_error(Anno, {redefine_record,Name}, St0);
+        true ->
+            St1 = add_error(Anno, {redefine_record,Name}, St0),
+            clear_nadocs(St1);
         false ->
             {Fs1,St1} = def_fields(normalise_fields(Fs0), Name, St0),
             St2 = St1#lint{records=maps:put(Name, {Anno,Fs1},
                                             St1#lint.records)},
             Types = [T || {typed_record_field, _, T} <- Fs0],
             St3 = St2#lint{type_id = {record, Name}},
-            check_type({type, nowarn(), product, Types}, St3)
+            St4 = check_type({type, nowarn(), product, Types}, St3),
+            flush_nadocs(recorddoc, Name, St4)
     end.
 
 %% def_fields([RecDef], RecordName, State) -> {[DefField],State}.
@@ -2894,20 +2939,24 @@ type_def(Attr, Anno, TypeName, ProtoType, Args, St0) ->
         true ->
             case is_obsolete_builtin_type(TypePair) of
                 true ->
-                    StoreType(St0);
+                    St1 = StoreType(St0),
+                    flush_nadocs(typedoc, {TypeName, Arity}, St1);
                 false ->
                     %% Starting from OTP 26, redefining built-in types
                     %% is allowed.
                     St1 = StoreType(St0),
-                    warn_redefined_builtin_type(Anno, TypePair, St1)
+                    St2 = warn_redefined_builtin_type(Anno, TypePair, St1),
+                    flush_nadocs(typedoc, {TypeName, Arity}, St2)
             end;
         false ->
             case is_map_key(TypePair, TypeDefs) of
                 true ->
-                    add_error(Anno, {redefine_type, TypePair}, St0);
+                    St1 = add_error(Anno, {redefine_type, TypePair}, St0),
+                    clear_nadocs(St1);
                 false ->
-                    StoreType(St0)
-	    end
+                    St1 = StoreType(St0),
+                    flush_nadocs(typedoc, {TypeName, Arity}, St1)
+        end
     end.
 
 warn_redefined_builtin_type(Anno, TypePair, #lint{compile=Opts}=St) ->
@@ -3154,6 +3203,144 @@ obsolete_builtin_type({1, 255}) ->
     {deprecated, {2, 255}, ""};
 obsolete_builtin_type({Name, A}) when is_atom(Name), is_integer(A) -> no.
 
+% Guarantees moduledoc be placed anywhhere, accordly to the EEP-59,
+% but this can be weird:
+%
+%     -moduledoc """
+%     This is the module doc.
+%     """
+%
+%     -doc """
+%     This is the foo doc.
+%     """
+%
+%     -moduledoc hidden.
+%
+%     foo() -> bar.
+%
+% TODO: Add error if string() is duplicated in non assoc or module docs
+doc_def(Anno, moduledoc, Def, #lint{docs=Docs}=St0) ->
+    ModuleDocs = proplists:lookup_all(moduledoc, Docs),
+    St = check_doc_def(Anno, moduledoc, Def, ModuleDocs, St0),
+    St#lint{docs=[{moduledoc,{Anno,Def}}|Docs]};
+doc_def(Anno, Attr, Def, #lint{nadocs=[{Attr, _}|_]=Docs}=St0) ->
+    St = check_doc_def(Anno, Attr, Def, Docs, St0),
+    St#lint{nadocs=[{Attr,{Anno,Def}}|Docs]};
+doc_def(Anno, Attr, Def, #lint{nadocs=[]}=St0) ->
+    St = check_doc_def(Anno, Attr, Def, [], St0),
+    St#lint{nadocs=[{Attr,{Anno,Def}}]};
+doc_def(Anno, _, _, #lint{nadocs=_}=St) ->
+    add_error(Anno,invalid_doc_sequence,St).
+
+flush_nadocs(Attr, Key, #lint{nadocs=Nadocs,docs=Docs0}=St) ->
+    Docs = foldl(fun ({A, Doc}, Acc) when A =:= Attr ->
+                        [{Attr,{Key,Doc}}|Acc];
+
+                        % When an error is raised, non-assoc docs are not
+                        % properly cleared and an unmatch clause error occurs.
+                        % The code below will throw and the bug appears:
+                        %
+                        %     -type foo() -> bar.
+                        %
+                        % TODO: Find a better way to solve this.
+                        ({_Attr, _Doc}, Acc) ->
+                            Acc
+                 end, Docs0, Nadocs),
+    St#lint{nadocs=[],docs=Docs}.
+
+clear_nadocs(#lint{}=St) ->
+    St#lint{nadocs=[]}.
+
+% TODO: Improve error messages. 'invalid_doc_def' should say what's the reason.
+% TODO: Simplify verification.
+check_doc_def(Anno, _Attr, Def, Docs, St) when is_binary(Def); is_list(Def) ->
+    case is_doc_defined(Docs) of
+        true ->
+            add_error(Anno,doc_already_defined,St);
+        false ->
+            St
+    end;
+check_doc_def(Anno, Attr, {doc,Doc}, Docs, St) ->
+    case is_doc_key_valid(Attr, doc, Doc) of
+        true ->
+            case is_doc_defined(Docs) of
+                true ->
+                    add_error(Anno,doc_already_defined,St);
+                false ->
+                    St
+            end;
+        false ->
+            add_error(Anno,invalid_doc_def,St)
+    end;
+check_doc_def(Anno, doc, {file,_}=File, Docs, St) ->
+    case is_doc_key_valid(doc, doc, File) of
+        true ->
+            case is_doc_defined(Docs) of
+                true ->
+                    add_error(Anno,doc_already_defined,St);
+                false ->
+                    St
+            end;
+        false ->
+            add_error(Anno,invalid_doc_def,St)
+    end;
+check_doc_def(Anno, Attr, Key, _Docs, St) when is_atom(Key) ->
+    case is_doc_key_valid(Attr, Key, true) of
+        true ->
+            St;
+        false ->
+            add_error(Anno,invalid_doc_def,St)
+    end;
+check_doc_def(Anno, Attr, {Key,Val}, _Docs, St) ->
+    case is_doc_key_valid(Attr, Key, Val) of
+        true ->
+            St;
+        false ->
+            add_error(Anno,invalid_doc_def,St)
+    end;
+check_doc_def(Anno, Attr, Def, Docs, St0) when is_map(Def) ->
+    maps:fold(
+        fun(Key, Val, St) ->
+            case is_doc_key_valid(Attr, Key, Val) of
+                true ->
+                    case Key =:= doc of
+                        true ->
+                            case is_doc_defined(Docs) of
+                                true ->
+                                    add_error(Anno,doc_already_defined,St);
+                                false ->
+                                    St
+                            end;
+                        false ->
+                            St
+                    end;
+                false ->
+                    add_error(Anno,invalid_doc_def,St)
+            end
+        end,
+        St0,
+        Def
+    );
+check_doc_def(Anno, _, _, _, St) ->
+    add_error(Anno,invalid_doc_def,St).
+
+is_doc_defined(Docs) ->
+    lists:any(fun ({_,{_,X}}) -> is_binary(X) orelse is_list(X) end, Docs).
+
+% TODO: Verify which keys and guards.
+is_doc_key_valid(_, doc, {file,X}) when is_list(X); is_binary(X) -> true;
+is_doc_key_valid(_, doc, X) when is_list(X); is_binary(X) -> true;
+is_doc_key_valid(_, hidden, X) when is_boolean(X) -> true;
+is_doc_key_valid(_, since, X) when is_list(X); is_binary(X) -> true;
+is_doc_key_valid(_, deprecated, X) when is_boolean(X); is_binary(X) -> true;
+is_doc_key_valid(moduledoc, author, X) when is_list(X); is_binary(X) -> true;
+is_doc_key_valid(moduledoc, copyright, X) when is_list(X); is_binary(X) -> true;
+is_doc_key_valid(moduledoc, license, {file,X}) when is_list(X); is_binary(X) -> true;
+is_doc_key_valid(moduledoc, license, X) when is_list(X); is_binary(X) -> true;
+is_doc_key_valid(doc, private, X) when is_boolean(X) -> true;
+is_doc_key_valid(typedoc, opaque, X) when is_boolean(X) -> true;
+is_doc_key_valid(_, _, _) -> false.
+
 %% spec_decl(Anno, Fun, Types, State) -> State.
 
 spec_decl(Anno, MFA0, TypeSpecs, St00 = #lint{specs = Specs, module = Mod}) ->
@@ -3181,15 +3368,19 @@ callback_decl(Anno, MFA0, TypeSpecs,
     case MFA0 of
         {M, _F, _A} ->
             St1 = check_module_name(M, Anno, St0),
-            add_error(Anno, {bad_callback, MFA0}, St1);
+            St2 = add_error(Anno, {bad_callback, MFA0}, St1),
+            clear_nadocs(St2);
         {F, Arity} ->
             MFA = {Mod, F, Arity},
             St1 = St0#lint{callbacks = maps:put(MFA, Anno, Callbacks)},
             case is_map_key(MFA, Callbacks) of
-                true -> add_error(Anno, {redefine_callback, MFA0}, St1);
+                true ->
+                    St2 = add_error(Anno, {redefine_callback, MFA0}, St1),
+                    clear_nadocs(St2);
                 false ->
                     St2 = St1#lint{type_id = {spec, MFA}},
-                    check_specs(TypeSpecs, callback_wrong_arity, Arity, St2)
+                    St3 = check_specs(TypeSpecs, callback_wrong_arity, Arity, St2),
+                    flush_nadocs(callbackdoc, {F, Arity}, St3)
             end
     end.
 
@@ -3262,6 +3453,17 @@ any_control_characters(Cs) ->
                     is_integer(C), 16#7F =< C, C < 16#A0 -> true;
            (_) -> false
         end, Cs).
+
+check_nadocs(#lint{nadocs=[]}=St) ->
+    St;
+check_nadocs(#lint{nadocs=Docs}=St0) ->
+    lists:foldl(
+        fun({_,{Anno,_}}, St) ->
+            add_warning(Anno,unbound_doc,St)
+        end,
+        St0,
+        Docs
+    ).
 
 check_specs([FunType|Left], ETag, Arity, St0) ->
     {FunType1, CTypes} =

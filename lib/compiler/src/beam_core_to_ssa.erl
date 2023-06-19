@@ -196,6 +196,11 @@ include_attribute(record) -> false;
 include_attribute(optional_callbacks) -> false;
 include_attribute(file) -> false;
 include_attribute(compile) -> false;
+include_attribute(moduledoc) -> false;
+include_attribute(doc) -> false;
+include_attribute(typedoc) -> false;
+include_attribute(callbackdoc) -> false;
+include_attribute(recorddoc) -> false;
 include_attribute(_) -> true.
 
 function({#c_var{name={F,Arity}=FA},Body}, St0) ->
