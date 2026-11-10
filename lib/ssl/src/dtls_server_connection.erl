@@ -548,7 +548,7 @@ handle_client_hello(#client_hello{client_version = ClientVersion} = Hello, State
                                               negotiated_protocol = CurrentProtocol} = HsEnv,
                connection_env = #connection_env{cert_key_alts = CertKeyAlts} = CEnv,
                session = Session0,
-               ssl_options = SslOpts} =
+               ssl_options = SslOpts} = State1 =
             tls_dtls_server_connection:handle_sni_extension(State0, Hello),
         SessionTracker = proplists:get_value(session_id_tracker, Trackers),
         {Version, {Type, Session}, ConnectionStates, Protocol0, ServerHelloExt, HashSign} =
@@ -562,7 +562,7 @@ handle_client_hello(#client_hello{client_version = ClientVersion} = Hello, State
 
         State =
             dtls_gen_connection:prepare_flight(
-              State0#state{connection_states =
+              State1#state{connection_states =
                                ConnectionStates,
                            connection_env = CEnv#connection_env{negotiated_version = Version},
                            handshake_env = HsEnv#handshake_env{
