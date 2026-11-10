@@ -271,6 +271,8 @@ ssl_config(Opts, Role, #state{static_env = InitStatEnv0,
            cert_key_alts := CertKeyAlts,
            dh_params := DHParams}} =
 	ssl_config:init(Opts, Role),
+    %% Release the trusted certs held under the options being replaced
+    ok = handle_trusted_certs_db(State0),
     TimeStamp = erlang:monotonic_time(),
     Session = State0#state.session,
 
@@ -1178,30 +1180,16 @@ handle_fatal_alert(Alert0, StateName,
     handle_normal_shutdown(Alert, StateName, State),
     {stop, {shutdown, normal}, State}.
 
-handle_trusted_certs_db(#state{ssl_options =#{cacerts := []} = Opts})
-  when not is_map_key(cacertfile, Opts) ->
-    %% No trusted certs specified
-    ok;
-handle_trusted_certs_db(#state{static_env = #static_env{cert_db_ref = Ref,
-                                                        cert_db = CertDb},
-                               ssl_options = Opts})
-  when CertDb =/= undefined, not is_map_key(cacertfile, Opts) ->
-    %% Certs provided as DER directly can not be shared
-    %% with other connections and it is safe to delete them when the connection ends.
-    ssl_pkix_db:remove_trusted_certs(Ref, CertDb);
 handle_trusted_certs_db(#state{static_env = #static_env{file_ref_db = undefined}}) ->
     %% Something went wrong early (typically cacertfile does not
     %% exist) so there is nothing to handle
     ok;
-handle_trusted_certs_db(#state{static_env = #static_env{cert_db_ref = Ref,
-                                                        file_ref_db = RefDb},
-			       ssl_options = #{cacertfile := File}}) ->
-    case ssl_pkix_db:ref_count(Ref, RefDb, -1) of
-	0 ->
-	    ssl_manager:clean_cert_db(Ref, File);
-	_ ->
-	    ok
-    end.
+handle_trusted_certs_db(#state{static_env = #static_env{cert_db_ref = Ref}})
+  when is_reference(Ref) ->
+    ssl_manager:release_trusted_certs(Ref);
+handle_trusted_certs_db(_) ->
+    %% Certs provided as DER directly are held by the connection
+    ok.
 
 maybe_invalidate_session(?TLS_1_3,_, _, _, _, _) ->
     ok;
@@ -1219,11 +1207,11 @@ terminate({shutdown, ktls}, connection, State) ->
 terminate({shutdown, downgrade}, downgrade, State) ->
     %% Socket shall not be closed as it should be returned to user
     handle_trusted_certs_db(State);
-terminate(_, _, #state{connection_env = #connection_env{socket_terminated = true}}) ->
+terminate(_, _, #state{connection_env = #connection_env{socket_terminated = true}} = State) ->
     %% Happens when user closes the connection using ssl:close/1 e.i. terminate
     %% is called explicitly beforehand to to guarantee that Transport:close has been called
     %% when ssl:close/1 returns. Or when using ssl:shutdown/2 with read_write
-    ok;
+    handle_trusted_certs_db(State);
 terminate({shutdown, transport_closed} = Reason,
 	  _StateName, #state{static_env = #static_env{protocol_cb = Connection,
                                                       socket = Socket,
@@ -1352,6 +1340,7 @@ handle_sni_hostname(Hostname,
                    cert_key_alts := CertKeyAlts,
                    dh_params := DHParams}} =
                 ssl_config:init(NewOptions, server),
+            ok = handle_trusted_certs_db(State0),
             State0#state{
               static_env = InitStatEnv0#static_env{
                              file_ref_db = FileRefHandle,

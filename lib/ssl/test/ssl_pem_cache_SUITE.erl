@@ -31,6 +31,7 @@
 -include_lib("kernel/include/file.hrl").
 -include_lib("public_key/include/public_key.hrl").
 -include("ssl_test_lib.hrl").
+-include_lib("ssl/src/ssl_api.hrl").
 
 %% Callback functions
 -export([all/0,
@@ -70,7 +71,13 @@
          alternative_path_symlink_relative/0,
          alternative_path_symlink_relative/1,
          cache_file_does_not_exist/0,
-         cache_file_does_not_exist/1
+         cache_file_does_not_exist/1,
+         cacerts_shutdown_read_write/0,
+         cacerts_shutdown_read_write/1,
+         cacerts_connection_killed/0,
+         cacerts_connection_killed/1,
+         cacerts_sni_handshake_failure/0,
+         cacerts_sni_handshake_failure/1
         ]).
 
 -export([check_cert/3]).
@@ -97,7 +104,10 @@ all() ->
      alternative_path_hardlink,
      alternative_path_symlink,
      alternative_path_symlink_relative,
-     cache_file_does_not_exist].
+     cache_file_does_not_exist,
+     cacerts_shutdown_read_write,
+     cacerts_connection_killed,
+     cacerts_sni_handshake_failure].
 
 groups() -> [].
 
@@ -447,9 +457,152 @@ cache_file_does_not_exist(Config) when is_list(Config)->
     [] = ssl_certificate:file_to_certificats(NonExistingFile, Id),
     [] = ssl_certificate:file_to_crls(NonExistingFile, Id).
 
+cacerts_shutdown_read_write() ->
+    [{doc, "Test that trusted CA certs are released by "
+      "a connection that was shut down with ssl:shutdown(Socket, read_write) "
+      "before it ended."}].
+cacerts_shutdown_read_write(Config) when is_list(Config) ->
+    ClientOpts0 = ssl_test_lib:ssl_options(client_rsa_opts, Config),
+    ServerOpts0 = ssl_test_lib:ssl_options(server_rsa_opts, Config),
+    Run = fun(ClientOpts, ServerOpts) ->
+                  [_, 0, 0, 0] = get_table_sizes(),
+                  {ok, Listen} = ssl:listen(0, [{active, false} | ServerOpts]),
+                  {ok, {_, Port}} = ssl:sockname(Listen),
+                  Self = self(),
+                  Pid = spawn_link(fun() ->
+                                           {ok, T} = ssl:transport_accept(Listen),
+                                           {ok, S} = ssl:handshake(T),
+                                           Self ! {server, self()},
+                                           receive close -> ssl:close(S) end,
+                                           Self ! {server_closed, self()}
+                                   end),
+                  {ok, Client} = ssl:connect("localhost", Port,
+                                             [{active, false} | ClientOpts]),
+                  receive {server, Pid} -> ok end,
+                  2 = get_total_number_of_references(),
+                  ok = ssl:shutdown(Client, read_write),
+                  ok = ssl:close(Client),
+                  Pid ! close,
+                  receive {server_closed, Pid} -> ok end,
+                  ok = ssl:close(Listen),
+                  0 = get_total_number_of_references(),
+                  [_, 0, 0, 0] = get_table_sizes()
+          end,
+    Run(ClientOpts0, ServerOpts0).
+
+cacerts_connection_killed() ->
+    [{doc, "Test that trusted CA certs are released by "
+      "a connection process that is killed, and so never runs its "
+      "terminate callback."}].
+cacerts_connection_killed(Config) when is_list(Config) ->
+    ClientOpts0 = ssl_test_lib:ssl_options(client_rsa_opts, Config),
+    ServerOpts0 = ssl_test_lib:ssl_options(server_rsa_opts, Config),
+    Run = fun(ClientOpts, ServerOpts) ->
+                  [_, 0, 0, 0] = get_table_sizes(),
+                  {ok, Listen} = ssl:listen(0, [{active, false} | ServerOpts]),
+                  {ok, {_, Port}} = ssl:sockname(Listen),
+                  Self = self(),
+                  spawn_link(fun() ->
+                                     {ok, T} = ssl:transport_accept(Listen),
+                                     {ok, S} = ssl:handshake(T),
+                                     ok = ssl:controlling_process(S, Self),
+                                     Self ! {server, S}
+                             end),
+                  {ok, Client} = ssl:connect("localhost", Port,
+                                             [{active, false} | ClientOpts]),
+                  Server = receive {server, S} -> S end,
+                  2 = get_total_number_of_references(),
+                  Pids = [Pid || #sslsocket{connection_handler = Pid} <- [Client, Server]],
+                  Monitors = [erlang:monitor(process, Pid) || Pid <- Pids],
+                  [exit(Pid, kill) || Pid <- Pids],
+                  [receive {'DOWN', M, process, _, killed} -> ok end || M <- Monitors],
+                  ok = ssl:close(Listen),
+                  0 = get_total_number_of_references(),
+                  [_, 0, 0, 0] = get_table_sizes()
+          end,
+    Run(ClientOpts0, ServerOpts0).
+
+cacerts_sni_handshake_failure() ->
+    [{doc, "Test that when the sni_fun replaces the CA certs and the "
+      "handshake then fails, the replaced CA certs are released once, so "
+      "they stay available to other connections, and the new ones are "
+      "released too."}].
+cacerts_sni_handshake_failure(Config) when is_list(Config) ->
+    ct:timetrap({minutes, 2}),
+    ServerOpts0 = ssl_test_lib:ssl_options(server_rsa_opts, Config),
+    ClientOpts0 = ssl_test_lib:ssl_options(client_rsa_opts, Config),
+    %% The sni_fun swaps the server CA certs for the client ones
+    SNIOpts = fun(file) -> [{cacertfile, proplists:get_value(cacertfile, ClientOpts0)}];
+                 (der) -> [{cacerts, proplists:get_value(cacerts,
+                                                         der_cacerts_opts(ClientOpts0))}]
+              end,
+    BaseOpts = fun(file) -> ServerOpts0;
+                  (der) -> der_cacerts_opts(ServerOpts0)
+               end,
+    %% The second client fails the handshake after the swap
+    Failing = fun('tlsv1.2') ->
+                      {[], [{ciphers, [#{key_exchange => psk, cipher => aes_128_cbc,
+                                         mac => sha, prf => default_prf}]}]};
+                 ('tlsv1.3') ->
+                      {[{supported_groups, [secp384r1]}],
+                       [{supported_groups, [x25519]}]}
+              end,
+    Run = fun(Mode, Version) ->
+                  [_, 0, 0, 0] = get_table_sizes(),
+                  ServerCAs = lists:sort(proplists:get_value(cacerts,
+                                                             der_cacerts_opts(ServerOpts0))),
+                  {ServerExtra, ClientExtra} = Failing(Version),
+                  ServerOpts = [{versions, [Version]},
+                                {sni_fun, fun(_) -> SNIOpts(Mode) end}
+                                | ServerExtra ++ proplists:delete(versions, BaseOpts(Mode))],
+                  {ok, Listen} = ssl:listen(0, [{active, false} | ServerOpts]),
+                  {ok, {_, Port}} = ssl:sockname(Listen),
+                  Self = self(),
+                  Acceptor = fun() ->
+                                     {ok, T} = ssl:transport_accept(Listen),
+                                     Self ! {handshake, ssl:handshake(T, 5000)},
+                                     receive close -> ok end
+                             end,
+                  Acceptors = [spawn_link(Acceptor) || _ <- [1, 2]],
+                  %% A connection that keeps using the server CA certs
+                  {ok, Client} = ssl:connect("localhost", Port,
+                                             [{verify, verify_none}, {versions, [Version]},
+                                              {server_name_indication, disable},
+                                              {active, false}]),
+                  {ok, Server} = receive {handshake, R1} -> R1 end,
+                  {error, _} = ssl:connect("localhost", Port,
+                                           [{verify, verify_none}, {versions, [Version]},
+                                            {server_name_indication, "localhost"}
+                                            | ClientExtra]),
+                  {error, _} = receive {handshake, R2} -> R2 end,
+                  %% Only the server CA certs, still used by the first
+                  %% connection, are left
+                  [_, _, 1, 1] = get_table_sizes(),
+                  ServerCAs = trusted_cert_ders(),
+                  1 = get_total_number_of_references(),
+                  ok = ssl:close(Client),
+                  ok = ssl:close(Server),
+                  [begin unlink(Pid), exit(Pid, kill) end || Pid <- Acceptors],
+                  ok = ssl:close(Listen),
+                  [_, 0, 0, 0] = get_table_sizes(),
+                  0 = get_total_number_of_references()
+          end,
+    [Run(Mode, Version) || Mode <- [file], Version <- ['tlsv1.2', 'tlsv1.3']],
+    ok.
+
 %%--------------------------------------------------------------------
 %% Internal functions
 %%--------------------------------------------------------------------
+trusted_cert_ders() ->
+    CertDb = proplists:get_value(cert, get_table_refs()),
+    lists:sort([Der || {_Key, #cert{der = Der}} <- ets:tab2list(CertDb)]).
+
+der_cacerts_opts(Opts) ->
+    CACertFile = proplists:get_value(cacertfile, Opts),
+    {ok, PemBin} = file:read_file(CACertFile),
+    CAs = [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(PemBin)],
+    [{cacerts, CAs} | proplists:delete(cacertfile, Opts)].
+
 get_table_sizes() ->
     ct:sleep(?SLEEP_AMOUNT),
     DbSizes = [{Label, Db, ssl_pkix_db:db_size(Db)} ||
@@ -457,9 +610,11 @@ get_table_sizes() ->
     [Size || {_, _, Size} <- DbSizes].
 
 get_total_number_of_references() ->
+    %% Connections release their references with messages to the manager
+    ct:sleep(?SLEEP_AMOUNT),
     CaFileRef = proplists:get_value(ca_ref_cnt, get_table_refs()),
-    CountReferencedFiles = fun({Ref, _}, Acc) ->
-                                   ets:update_counter(CaFileRef,Ref,0) + Acc
+    CountReferencedFiles = fun({_Ref, Count}, Acc) ->
+                                   Count + Acc
                            end,
     ets:foldl(CountReferencedFiles, 0, CaFileRef).
 

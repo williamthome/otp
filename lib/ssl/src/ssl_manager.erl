@@ -37,7 +37,7 @@
 -export([start_link/1, start_link_dist/1,
 	 connection_init/3, cache_pem_file/2,
 	 lookup_trusted_cert/4,
-	 clean_cert_db/2,
+	 release_trusted_certs/1,
          refresh_trusted_db/1, refresh_trusted_db/2,
 	 register_session/4, invalidate_session/2,
          insert_crls/2, insert_crls/3, async_insert_crls/3,
@@ -78,7 +78,10 @@
                 session_client_invalidator,
                 options,
                 client_session_order,
-                max_crl_cache_size
+                max_crl_cache_size,
+                %% Monitor and trusted certs entries held by each
+                %% connection process
+                trusted_certs_users = #{} :: #{pid() => {reference(), [reference()]}}
                }).
 
 -define(GEN_UNIQUE_ID_MAX_TRIES, 10).
@@ -171,15 +174,15 @@ lookup_trusted_cert(DbHandle, Ref, SerialNumber, Issuer) ->
     ssl_pkix_db:lookup_trusted_cert(DbHandle, Ref, SerialNumber, Issuer).
 
 %%--------------------------------------------------------------------
--spec clean_cert_db(reference(), binary()) -> ok.
+-spec release_trusted_certs(reference()) -> ok.
 %%
-%% Description: Send clean request of cert db to ssl_manager process should
-%% be called by ssl-connection processes. 
+%% Description: Releases the trusted certs entry <Ref> taken by the
+%% calling connection process with connection_init/3, when it replaces
+%% its options or ends. The entry is also released if the process dies
+%% without doing so.
 %%--------------------------------------------------------------------
-clean_cert_db(Ref, File) ->
-    erlang:send_after(?CLEAN_CERT_DB, get(ssl_manager), 
-		      {clean_cert_db, Ref, File}),
-    ok.
+release_trusted_certs(Ref) ->
+    cast({release_trusted_certs, self(), Ref}).
 
 %%--------------------------------------------------------------------
 -spec refresh_trusted_db(normal | dist) -> ok.
@@ -308,9 +311,10 @@ handle_call({{connection_init, <<>>, Role, {CRLCb, UserCRLDb}}, _Pid}, _From,
                    crl_db_info => {CRLCb, crl_db_info(Db, UserCRLDb)}}}, State};
 
 handle_call({{connection_init, Trustedcerts, Role, {CRLCb, UserCRLDb}}, Pid}, _From,
-	    #state{certificate_db = [CertDb, FileRefDb, PemCache | _] = Db} = State) ->
+	    #state{certificate_db = [CertDb, FileRefDb, PemCache | _] = Db} = State0) ->
     case add_trusted_certs(Pid, Trustedcerts, Db) of
 	{ok, Ref} ->
+            State = hold_trusted_certs(Pid, Ref, State0),
 	    {reply, {ok, #{cert_db_ref => Ref, 
                            cert_db_handle => CertDb, 
                            fileref_db_handle => FileRefDb, 
@@ -318,7 +322,7 @@ handle_call({{connection_init, Trustedcerts, Role, {CRLCb, UserCRLDb}}, Pid}, _F
                            session_cache => session_cache(Role, State), 
                            crl_db_info => {CRLCb, crl_db_info(Db, UserCRLDb)}}}, State};
         {error, _} = Error ->
-            {reply, Error, State}
+            {reply, Error, State0}
     end;
 
 handle_call({{insert_crls, Path, CRLs}, _}, _From,   
@@ -350,6 +354,8 @@ handle_call({{refresh_trusted_db, File}, _}, _, #state{certificate_db = Db} = St
 %%
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
+handle_cast({release_trusted_certs, Pid, Ref}, State) ->
+    {noreply, release_trusted_certs(Pid, Ref, State)};
 handle_cast({register_session, Host, Port, Session, unique}, State0) ->
     State = client_register_unique_session(Host, Port, Session, State0), 
     {noreply, State};
@@ -388,16 +394,26 @@ handle_info(validate_sessions, #state{session_cache_client_cb = CacheCb,
     {noreply, State#state{session_validation_timer = Timer, 
 			  session_client_invalidator = CPid}};
 
-handle_info({clean_cert_db, Ref, File},
+handle_info({clean_cert_db, Ref},
 	    #state{certificate_db = [CertDb, {RefDb, FileMapDb} | _]} = State) ->
     
     case ssl_pkix_db:lookup(Ref, RefDb) of
 	undefined -> %% Already cleaned
 	    ok;
 	_ ->
-	    clean_cert_db(Ref, CertDb, RefDb, FileMapDb, File)
+	    clean_cert_db(Ref, CertDb, RefDb, FileMapDb)
     end,
     {noreply, State};
+handle_info({'DOWN', Monitor, process, Pid, _},
+            #state{trusted_certs_users = Users} = State) ->
+    case Users of
+        #{Pid := {Monitor, Refs}} ->
+            %% The connection ended, or was killed, without releasing these
+            {noreply, lists:foldl(fun(Ref, S) -> release_trusted_certs(Pid, Ref, S) end,
+                                  State, Refs)};
+        #{} ->
+            {noreply, State}
+    end;
 handle_info({'EXIT', Pid, _}, #state{session_client_invalidator = Pid} = State) ->
     {noreply, State#state{session_client_invalidator = undefined}};
 handle_info(_Info, State) ->
@@ -491,11 +507,57 @@ invalidate_session(Cache, CacheCb, Key, _Session,
                                   client_session_order = gb_trees:delete(InternalId, Order)}}
     end.
 
-clean_cert_db(Ref, CertDb, RefDb, FileMapDb, File) ->
+%% Certs given as DER are not counted, their ref holds the certs
+hold_trusted_certs(Pid, Ref, #state{trusted_certs_users = Users} = State)
+  when is_reference(Ref) ->
+    User = case Users of
+               #{Pid := {Monitor, Refs}} ->
+                   {Monitor, [Ref | Refs]};
+               #{} ->
+                   {erlang:monitor(process, Pid), [Ref]}
+           end,
+    State#state{trusted_certs_users = Users#{Pid => User}};
+hold_trusted_certs(_, _, State) ->
+    State.
+
+%% Releases one use of Ref by Pid. A ref not held by Pid, such as the
+%% uncounted ref of a connection without trusted certs or one already
+%% released, is ignored.
+release_trusted_certs(Pid, Ref, #state{trusted_certs_users = Users,
+                                       certificate_db = [_, RefDb | _]} = State) ->
+    case Users of
+        #{Pid := {Monitor, Refs}} ->
+            case lists:member(Ref, Refs) of
+                true ->
+                    case ssl_pkix_db:ref_count(Ref, RefDb, -1) of
+                        0 ->
+                            %% Cleaned a bit later, so that a new
+                            %% connection may take it over meanwhile
+                            erlang:send_after(?CLEAN_CERT_DB, self(),
+                                              {clean_cert_db, Ref});
+                        _ ->
+                            ok
+                    end,
+                    case lists:delete(Ref, Refs) of
+                        [] ->
+                            erlang:demonitor(Monitor, [flush]),
+                            State#state{trusted_certs_users = maps:remove(Pid, Users)};
+                        Rest ->
+                            State#state{trusted_certs_users = Users#{Pid := {Monitor, Rest}}}
+                    end;
+                false ->
+                    State
+            end;
+        #{} ->
+            State
+    end.
+
+clean_cert_db(Ref, CertDb, RefDb, FileMapDb) ->
     case ssl_pkix_db:ref_count(Ref, RefDb, 0) of
 	0 ->
 	    ssl_pkix_db:remove(Ref, RefDb),
-	    ssl_pkix_db:remove(File, FileMapDb),
+            %% The file name of the entry is found by its ref
+            true = ets:match_delete(FileMapDb, {'_', Ref}),
 	    ssl_pkix_db:remove_trusted_certs(Ref, CertDb);
 	_ ->
 	    ok
