@@ -2255,10 +2255,13 @@ der_input(Config) when is_list(Config) ->
     {status, _, _, StatusInfo} = sys:get_status(whereis(ssl_manager)),
     [_, _,_, _, Prop] = StatusInfo,
     State = ssl_test_lib:state(Prop),
-    [CADb | _] = element(5, State),
+    [_CADb, {RefDb, FileMapDb} | _] = element(5, State),
     ct:sleep(?SLEEP*2), %%Make sure there is no outstanding clean cert db msg in manager
-    Size = ets:info(CADb, size),
-    ?CT_LOG("Size ~p", [Size]),
+    %% Earlier test cases may still have connections that use CA certs,
+    %% so only look at the entries added for the DER lists of this test
+    DerKeys0 = der_cacerts_keys(FileMapDb),
+    ?CT_LOG("CA entries in use: ~p",
+            [[{Key, ets:lookup(RefDb, Ref)} || {Key, Ref} <- ets:tab2list(FileMapDb)]]),
 
     SeverVerifyOpts = ssl_test_lib:ssl_options(server_rsa_opts, Config),
     {ServerCert, ServerKey, ServerCaCerts, DHParams} = der_input_opts([{dhfile, DHParamFile} |
@@ -2284,10 +2287,15 @@ der_input(Config) when is_list(Config) ->
 					{options, [{active, false} | ClientOpts]}]),
 
     ssl_test_lib:check_result(Server, ok, Client, ok),
+    %% CA certs given as DER are shared in the CA DB while in use, one
+    %% entry per list ...
+    DerKeys = der_cacerts_keys(FileMapDb) -- DerKeys0,
+    2 = length(DerKeys),
     ssl_test_lib:close(Server),
     ssl_test_lib:close(Client),
-    %% Using only DER input should not increase file indexed DB 
-    Size = ets:info(CADb, size),
+    %% ... and removed when the last connection using them has ended
+    ct:sleep(?SLEEP*2),
+    [] = der_cacerts_keys(FileMapDb) -- DerKeys0,
 
     ServerOpts1 = [{verify, verify_peer}, {fail_if_no_peer_cert, true},
                    {dh, DHParams},
@@ -2310,10 +2318,13 @@ der_input(Config) when is_list(Config) ->
                                          {options, [{active, false} | ClientOpts1]}]),
 
     ssl_test_lib:check_result(Server1, ok, Client1, ok),
+    %% The same certs given as #cert{} records share the entries of the
+    %% DER lists
+    DerKeys = der_cacerts_keys(FileMapDb) -- DerKeys0,
     ssl_test_lib:close(Server1),
     ssl_test_lib:close(Client1),
-    %% Using only DER input should not increase file indexed DB 
-    Size = ets:info(CADb, size),
+    ct:sleep(?SLEEP*2),
+    [] = der_cacerts_keys(FileMapDb) -- DerKeys0,
 
     ok.
 
@@ -4602,6 +4613,9 @@ start_server_negative(Config, Options, Error) ->
 
     ?CT_LOG("Actual: ~p~nExpected: ~p", [Server,Error]),
     Error = Server.
+
+der_cacerts_keys(FileMapDb) ->
+    lists:sort([Key || {{der, _} = Key, _Ref} <- ets:tab2list(FileMapDb)]).
 
 der_input_opts(Opts) ->
     Certfile = proplists:get_value(certfile, Opts),

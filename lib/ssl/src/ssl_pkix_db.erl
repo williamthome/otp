@@ -36,10 +36,14 @@
 	 add_crls/3, remove_crls/2, remove/1, add_trusted_certs/3, 
          refresh_trusted_certs/2,
          refresh_trusted_certs/3,
-	 extract_trusted_certs/1,
+	 extract_trusted_certs/1, decode_trusted_certs/1,
 	 remove_trusted_certs/2, insert/3, remove/2, clear/1, db_size/1,
 	 ref_count/3, lookup_trusted_cert/4, foldl/3, select_certentries_by_ref/2,
 	 select_certs_by_ref/2, decode_pem_file/1, lookup/2]).
+
+-type decoded_trusted_cert() :: {SerialNumber :: integer(),
+                                 Issuer :: public_key:issuer_name(),
+                                 public_key:combined_cert()}.
 
 %%====================================================================
 %% Internal application API
@@ -128,20 +132,40 @@ lookup_trusted_cert(_DbHandle, {extracted,Certs}, SerialNumber, Issuer) ->
     end.
 
 %%--------------------------------------------------------------------
--spec add_trusted_certs(pid(), {erlang:timestamp(), string()} |
-			{der, list()}, [ssl_manager:db_handle()]) -> {ok, [ssl_manager:db_handle()]}.
+-spec add_trusted_certs(pid(), binary() | {der, {der, binary()}} |
+			{der, {der, binary()}, [decoded_trusted_cert()]},
+			[ssl_manager:db_handle()]) ->
+          {ok, reference()} | {error, not_cached | term()}.
 %%
-%% Description: Adds the trusted certificates from file <File> to the
-%% runtime database. Returns Ref that should be handed to lookup_trusted_cert
-%% together with the cert serialnumber and issuer.
+%% Description: Adds the trusted certificates from file <File>, or from a
+%% DER list identified by its content hash, to the runtime database, or
+%% shares the entry already added for the same file or list. Returns Ref
+%% that should be handed to lookup_trusted_cert together with the cert
+%% serialnumber and issuer. A DER list is first looked up by its key
+%% alone, and only when it is not cached added with its certs, decoded
+%% by the connection with decode_trusted_certs/1.
 %%--------------------------------------------------------------------
-add_trusted_certs(_Pid, {extracted, _} = Certs, _) ->
-    {ok, Certs};
-
-add_trusted_certs(_Pid, {der, DerList}, [CertDb, _, _ | _]) ->
-    NewRef = make_ref(),
-    add_certs_from_der(DerList, NewRef, CertDb),
-    {ok, NewRef};
+add_trusted_certs(_Pid, {der, Key}, [_, {RefDb, FileMapDb} | _]) ->
+    case lookup(Key, FileMapDb) of
+	[Ref] ->
+	    ref_count(Ref, RefDb, 1),
+	    {ok, Ref};
+	undefined ->
+	    {error, not_cached}
+    end;
+add_trusted_certs(_Pid, {der, Key, Certs}, [CertDb, {RefDb, FileMapDb} = RefDbs | _]) ->
+    case lookup(Key, FileMapDb) of
+	[Ref] ->
+            %% Added by another connection since it was looked up
+	    ref_count(Ref, RefDb, 1),
+	    {ok, Ref};
+	undefined ->
+	    Ref = make_ref(),
+	    init_ref_db(Ref, Key, RefDbs),
+            true = ets:insert(CertDb, [{{Ref, SerialNumber, Issuer}, Cert} ||
+                                          {SerialNumber, Issuer, Cert} <- Certs]),
+	    {ok, Ref}
+    end;
 
 add_trusted_certs(_Pid, File, [_, {RefDb, FileMapDb} | _] = Db) ->
     case lookup(File, FileMapDb) of
@@ -162,11 +186,27 @@ refresh_trusted_certs(File, [CertsDb, {_, FileMapDb} | _], PemCache) ->
             ok
     end.
 refresh_trusted_certs([_, {_, FileMapDb} | _] = Db, PemCache) ->
-    Refresh = fun({File, _}, Acc) ->
+    Refresh = fun({{der, _}, _}, Acc) ->
+                      %% Shared DER certs come from options, not a file.
+                      Acc;
+                 ({File, _}, Acc) ->
                       refresh_trusted_certs(File, Db, PemCache),
                       Acc
               end,
     foldl(Refresh, refresh, FileMapDb).
+
+%%--------------------------------------------------------------------
+-spec decode_trusted_certs([public_key:der_encoded() | public_key:combined_cert()]) ->
+          [decoded_trusted_cert()].
+%%
+%% Description: Decodes trusted certs given as DER, keeping the decoded
+%% part of certs already given decoded, for add_trusted_certs/3.
+%% Certs that can not be decoded are left out.
+%%--------------------------------------------------------------------
+decode_trusted_certs(CaCerts) ->
+    [{SerialNumber, Issuer, Cert} ||
+        CaCert <- CaCerts,
+        {decoded, {{_, SerialNumber, Issuer}, Cert}} <- [decode_cert(undefined, CaCert)]].
 
 extract_trusted_certs({der, DerList}) ->
     {ok, {extracted, certs_from_der(DerList)}};
@@ -312,11 +352,6 @@ init_ref_db(Ref, File, {RefDb, FileMapDb}) ->
 
 remove_certs(Ref, CertsDb) ->
     true = ets:match_delete(CertsDb, {{Ref, '_', '_'}, '_'}),
-    ok.
-
-add_certs_from_der(DerList, Ref, CertsDb) ->
-    Add = fun(Cert) -> add_cert(Cert, Ref, CertsDb) end,
-    [Add(Cert) || Cert <- DerList],
     ok.
 
 certs_from_der(DerList) ->

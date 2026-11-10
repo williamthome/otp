@@ -1184,12 +1184,8 @@ handle_trusted_certs_db(#state{static_env = #static_env{file_ref_db = undefined}
     %% Something went wrong early (typically cacertfile does not
     %% exist) so there is nothing to handle
     ok;
-handle_trusted_certs_db(#state{static_env = #static_env{cert_db_ref = Ref}})
-  when is_reference(Ref) ->
-    ssl_manager:release_trusted_certs(Ref);
-handle_trusted_certs_db(_) ->
-    %% Certs provided as DER directly are held by the connection
-    ok.
+handle_trusted_certs_db(#state{static_env = #static_env{cert_db_ref = Ref}}) ->
+    ssl_manager:release_trusted_certs(Ref).
 
 maybe_invalidate_session(?TLS_1_3,_, _, _, _, _) ->
     ok;

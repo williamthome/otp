@@ -72,12 +72,20 @@
          alternative_path_symlink_relative/1,
          cache_file_does_not_exist/0,
          cache_file_does_not_exist/1,
+         der_cacerts_shared/0,
+         der_cacerts_shared/1,
+         der_cacerts_concurrent/0,
+         der_cacerts_concurrent/1,
+         der_cacerts_new_options_in_handshake/0,
+         der_cacerts_new_options_in_handshake/1,
          cacerts_shutdown_read_write/0,
          cacerts_shutdown_read_write/1,
          cacerts_connection_killed/0,
          cacerts_connection_killed/1,
          cacerts_sni_handshake_failure/0,
-         cacerts_sni_handshake_failure/1
+         cacerts_sni_handshake_failure/1,
+         der_cacerts_added_once/0,
+         der_cacerts_added_once/1
         ]).
 
 -export([check_cert/3]).
@@ -105,9 +113,13 @@ all() ->
      alternative_path_symlink,
      alternative_path_symlink_relative,
      cache_file_does_not_exist,
+     der_cacerts_shared,
+     der_cacerts_concurrent,
+     der_cacerts_new_options_in_handshake,
      cacerts_shutdown_read_write,
      cacerts_connection_killed,
-     cacerts_sni_handshake_failure].
+     cacerts_sni_handshake_failure,
+     der_cacerts_added_once].
 
 groups() -> [].
 
@@ -457,8 +469,119 @@ cache_file_does_not_exist(Config) when is_list(Config)->
     [] = ssl_certificate:file_to_certificats(NonExistingFile, Id),
     [] = ssl_certificate:file_to_crls(NonExistingFile, Id).
 
+der_cacerts_shared() ->
+    [{doc, "Test that CA certs given as DER are stored once in the CA store "
+      "and shared by all connections using the same list, and that they "
+      "are removed when the last of those connections ends."}].
+%% 1. Server and client options give their CA certs as DER (cacerts)
+%% 2. 1st TLS connection adds one CA store entry per DER list
+%% 3. 2nd TLS connection with the same lists reuses those entries, only
+%%    the reference counts grow
+%% 4. Closing the 1st connection keeps the entries, closing the 2nd
+%%    removes them
+der_cacerts_shared(Config) when is_list(Config) ->
+    [0, 0, 0, 0] = get_table_sizes(),
+    ClientOpts = der_cacerts_opts(ssl_test_lib:ssl_options(client_rsa_opts, Config)),
+    ServerOpts = der_cacerts_opts(ssl_test_lib:ssl_options(server_rsa_opts, Config)),
+    NumCAs = length(proplists:get_value(cacerts, ClientOpts)) +
+        length(proplists:get_value(cacerts, ServerOpts)),
+
+    {Server, Client} = verify_test_no_close(ClientOpts, ServerOpts, Config),
+    2 = get_total_number_of_references(),
+    [_, NumCAs, 2, 2] = get_table_sizes(),
+
+    {Server1, Client1} = verify_test_no_close(ClientOpts, ServerOpts, Config),
+    4 = get_total_number_of_references(),
+    [_, NumCAs, 2, 2] = get_table_sizes(),
+
+    [ssl_test_lib:close(A) || A <- [Server, Client]],
+    2 = get_total_number_of_references(),
+    [_, NumCAs, 2, 2] = get_table_sizes(),
+
+    [ssl_test_lib:close(A) || A <- [Server1, Client1]],
+    0 = get_total_number_of_references(),
+    [_, 0, 0, 0] = get_table_sizes().
+
+der_cacerts_concurrent() ->
+    [{doc, "Test that connections started at the same time with the same "
+      "CA certs given as DER, that each find them not yet stored, end up "
+      "sharing one CA store entry."}].
+der_cacerts_concurrent(Config) when is_list(Config) ->
+    [0, 0, 0, 0] = get_table_sizes(),
+    ClientOpts = der_cacerts_opts(ssl_test_lib:ssl_options(client_rsa_opts, Config)),
+    ServerOpts = ssl_test_lib:ssl_options(server_rsa_opts, Config),
+    NumClientCAs = length(proplists:get_value(cacerts, ClientOpts)),
+    N = 20,
+    {ok, Listen} = ssl:listen(0, [{active, false}, {backlog, N} | ServerOpts]),
+    {ok, {_, Port}} = ssl:sockname(Listen),
+    Self = self(),
+    Clients = [spawn_link(fun() ->
+                                  {ok, C} = ssl:connect("localhost", Port,
+                                                        [{active, false} | ClientOpts]),
+                                  Self ! {connected, self()},
+                                  receive close -> ssl:close(C) end,
+                                  Self ! {closed, self()}
+                          end) || _ <- lists:seq(1, N)],
+    Servers = [begin
+                   {ok, T} = ssl:transport_accept(Listen),
+                   {ok, S} = ssl:handshake(T),
+                   S
+               end || _ <- Clients],
+    [receive {connected, Pid} -> ok end || Pid <- Clients],
+    %% One entry for the client DER list and one for the server cacertfile
+    NumRefs = 2 * N,
+    NumRefs = get_total_number_of_references(),
+    [_, CAs, 2, 2] = get_table_sizes(),
+    true = CAs > NumClientCAs,
+
+    [ssl:close(S) || S <- Servers],
+    [begin Pid ! close, receive {closed, Pid} -> ok end end || Pid <- Clients],
+    ok = ssl:close(Listen),
+    0 = get_total_number_of_references(),
+    [_, 0, 0, 0] = get_table_sizes().
+
+der_cacerts_new_options_in_handshake() ->
+    [{doc, "Test that CA certs held under the listen options are released "
+      "when ssl:handshake/3 replaces them, and that the new ones are "
+      "released when the connection ends."}].
+%% 1. Listen with the server CA certs as DER, then ssl:handshake/3 with
+%%    the client CA certs added to the list
+%% 2. Only the new server list and the client list are referenced
+%% 3. Closing the connection removes all CA store entries
+der_cacerts_new_options_in_handshake(Config) when is_list(Config) ->
+    [0, 0, 0, 0] = get_table_sizes(),
+    ClientOpts = der_cacerts_opts(ssl_test_lib:ssl_options(client_rsa_opts, Config)),
+    ServerOpts = der_cacerts_opts(ssl_test_lib:ssl_options(server_rsa_opts, Config)),
+    ClientCAs = proplists:get_value(cacerts, ClientOpts),
+    %% The CA store is keyed by serial and issuer per list, so count
+    %% certs that are in both lists once
+    NewServerCAs = lists:usort(proplists:get_value(cacerts, ServerOpts) ++ ClientCAs),
+    {ok, Listen} = ssl:listen(0, [{active, false} | ServerOpts]),
+    {ok, {_, Port}} = ssl:sockname(Listen),
+    Self = self(),
+    Pid = spawn_link(fun() ->
+                             {ok, C} = ssl:connect("localhost", Port,
+                                                   [{active, false} | ClientOpts]),
+                             Self ! {client, self()},
+                             receive close -> ssl:close(C) end,
+                             Self ! {client_closed, self()}
+                     end),
+    {ok, Transport} = ssl:transport_accept(Listen),
+    {ok, Socket} = ssl:handshake(Transport, [{cacerts, NewServerCAs}]),
+    receive {client, Pid} -> ok end,
+    2 = get_total_number_of_references(),
+    NumCAs = length(NewServerCAs) + length(ClientCAs),
+    [_, NumCAs, 2, 2] = get_table_sizes(),
+
+    ok = ssl:close(Socket),
+    Pid ! close,
+    receive {client_closed, Pid} -> ok end,
+    ok = ssl:close(Listen),
+    0 = get_total_number_of_references(),
+    [_, 0, 0, 0] = get_table_sizes().
+
 cacerts_shutdown_read_write() ->
-    [{doc, "Test that trusted CA certs are released by "
+    [{doc, "Test that trusted CA certs, given as DER or as a file, are released by "
       "a connection that was shut down with ssl:shutdown(Socket, read_write) "
       "before it ended."}].
 cacerts_shutdown_read_write(Config) when is_list(Config) ->
@@ -488,10 +611,11 @@ cacerts_shutdown_read_write(Config) when is_list(Config) ->
                   0 = get_total_number_of_references(),
                   [_, 0, 0, 0] = get_table_sizes()
           end,
-    Run(ClientOpts0, ServerOpts0).
+    Run(ClientOpts0, ServerOpts0),
+    Run(der_cacerts_opts(ClientOpts0), der_cacerts_opts(ServerOpts0)).
 
 cacerts_connection_killed() ->
-    [{doc, "Test that trusted CA certs are released by "
+    [{doc, "Test that trusted CA certs, given as DER or as a file, are released by "
       "a connection process that is killed, and so never runs its "
       "terminate callback."}].
 cacerts_connection_killed(Config) when is_list(Config) ->
@@ -520,7 +644,8 @@ cacerts_connection_killed(Config) when is_list(Config) ->
                   0 = get_total_number_of_references(),
                   [_, 0, 0, 0] = get_table_sizes()
           end,
-    Run(ClientOpts0, ServerOpts0).
+    Run(ClientOpts0, ServerOpts0),
+    Run(der_cacerts_opts(ClientOpts0), der_cacerts_opts(ServerOpts0)).
 
 cacerts_sni_handshake_failure() ->
     [{doc, "Test that when the sni_fun replaces the CA certs and the "
@@ -587,8 +712,31 @@ cacerts_sni_handshake_failure(Config) when is_list(Config) ->
                   [_, 0, 0, 0] = get_table_sizes(),
                   0 = get_total_number_of_references()
           end,
-    [Run(Mode, Version) || Mode <- [file], Version <- ['tlsv1.2', 'tlsv1.3']],
+    [Run(Mode, Version) || Mode <- [file, der], Version <- ['tlsv1.2', 'tlsv1.3']],
     ok.
+
+der_cacerts_added_once() ->
+    [{doc, "White box test that CA certs given as DER that two connections "
+      "both found not stored, and so both decoded, are added once."}].
+der_cacerts_added_once(Config) when is_list(Config) ->
+    Db = [CertDb, {RefDb, FileMapDb} | _] = ssl_pkix_db:create(ssl_pem_cache:name(normal)),
+    CAs = proplists:get_value(cacerts,
+                              der_cacerts_opts(ssl_test_lib:ssl_options(client_rsa_opts, Config))),
+    %% Any key will do, it is computed by ssl_manager:connection_init/3
+    Key = {der, crypto:hash(sha256, CAs)},
+    {error, not_cached} = ssl_pkix_db:add_trusted_certs(self(), {der, Key}, Db),
+    Certs = ssl_pkix_db:decode_trusted_certs(CAs),
+    %% Certs given decoded give the same entries
+    Certs = ssl_pkix_db:decode_trusted_certs(
+              [#cert{der = Der, otp = public_key:pkix_decode_cert(Der, otp)} || Der <- CAs]),
+    {ok, Ref} = ssl_pkix_db:add_trusted_certs(self(), {der, Key, Certs}, Db),
+    {ok, Ref} = ssl_pkix_db:add_trusted_certs(self(), {der, Key, Certs}, Db),
+    {ok, Ref} = ssl_pkix_db:add_trusted_certs(self(), {der, Key}, Db),
+    [{Ref, 3}] = ets:lookup(RefDb, Ref),
+    [{Key, Ref}] = ets:tab2list(FileMapDb),
+    NumCAs = length(CAs),
+    NumCAs = length(ssl_pkix_db:select_certentries_by_ref(Ref, CertDb)),
+    ok = ssl_pkix_db:remove(Db).
 
 %%--------------------------------------------------------------------
 %% Internal functions
@@ -602,6 +750,21 @@ der_cacerts_opts(Opts) ->
     {ok, PemBin} = file:read_file(CACertFile),
     CAs = [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(PemBin)],
     [{cacerts, CAs} | proplists:delete(cacertfile, Opts)].
+
+verify_test_no_close(ClientOpts, ServerOpts, Config) ->
+    {ClientNode, ServerNode, Hostname} = ssl_test_lib:run_where(Config),
+    Server = ssl_test_lib:start_server([{node, ServerNode}, {port, 0},
+					{from, self()},
+					{mfa, {ssl_test_lib, send_recv_result_active, []}},
+					{options, ServerOpts}]),
+    Port = ssl_test_lib:inet_port(Server),
+    Client = ssl_test_lib:start_client([{node, ClientNode}, {port, Port},
+					{host, Hostname},
+					{from, self()},
+					{mfa, {ssl_test_lib, send_recv_result_active, []}},
+					{options, ClientOpts}]),
+    ssl_test_lib:check_result(Server, ok, Client, ok),
+    {Server, Client}.
 
 get_table_sizes() ->
     ct:sleep(?SLEEP_AMOUNT),

@@ -131,17 +131,33 @@ start_link_dist(Opts) ->
 			  ?MODULE, [DistMangerName, DistCacheName, Opts], []).
 
 %%--------------------------------------------------------------------
--spec connection_init(binary()| {der, list()}, client | server, 
+-spec connection_init(binary() | {der, [public_key:der_encoded() | public_key:combined_cert()]},
+                      client | server,
 		      {Cb :: atom(), Handle:: term()}) ->
 			     {ok, map()}.
 %%			     
 %% Description: Do necessary initializations for a new connection.
 %%--------------------------------------------------------------------
-connection_init({der, _} = Trustedcerts, Role, CRLCache) ->
-    {ok, Extracted} = ssl_pkix_db:extract_trusted_certs(Trustedcerts),
-    call({connection_init, Extracted, Role, CRLCache});
+connection_init({der, []}, Role, CRLCache) ->
+    call({connection_init, <<>>, Role, CRLCache});
+connection_init({der, CaCerts}, Role, CRLCache) ->
+    Ders = [Der || Der <- [cert_der(Cert) || Cert <- CaCerts], is_binary(Der)],
+    Key = {der, crypto:hash(sha256, [[<<(byte_size(Der)):32>>, Der] || Der <- Ders])},
+    case call({connection_init, {der, Key}, Role, CRLCache}) of
+        {error, not_cached} ->
+            %% Decode in the connection process, not in the manager,
+            %% so that connections with different lists do not wait
+            %% for each other
+            Certs = ssl_pkix_db:decode_trusted_certs(CaCerts),
+            call({connection_init, {der, Key, Certs}, Role, CRLCache});
+        Result ->
+            Result
+    end;
 connection_init(Trustedcerts, Role, CRLCache) ->
     call({connection_init, Trustedcerts, Role, CRLCache}).
+
+cert_der(#cert{der = Der}) -> Der;
+cert_der(Other) -> Other.
 
 %%--------------------------------------------------------------------
 -spec cache_pem_file(binary(), term()) -> {ok, term()} | {error, ssl:reason()}.
@@ -507,18 +523,14 @@ invalidate_session(Cache, CacheCb, Key, _Session,
                                   client_session_order = gb_trees:delete(InternalId, Order)}}
     end.
 
-%% Certs given as DER are not counted, their ref holds the certs
-hold_trusted_certs(Pid, Ref, #state{trusted_certs_users = Users} = State)
-  when is_reference(Ref) ->
+hold_trusted_certs(Pid, Ref, #state{trusted_certs_users = Users} = State) ->
     User = case Users of
                #{Pid := {Monitor, Refs}} ->
                    {Monitor, [Ref | Refs]};
                #{} ->
                    {erlang:monitor(process, Pid), [Ref]}
            end,
-    State#state{trusted_certs_users = Users#{Pid => User}};
-hold_trusted_certs(_, _, State) ->
-    State.
+    State#state{trusted_certs_users = Users#{Pid => User}}.
 
 %% Releases one use of Ref by Pid. A ref not held by Pid, such as the
 %% uncounted ref of a connection without trusted certs or one already
@@ -556,7 +568,8 @@ clean_cert_db(Ref, CertDb, RefDb, FileMapDb) ->
     case ssl_pkix_db:ref_count(Ref, RefDb, 0) of
 	0 ->
 	    ssl_pkix_db:remove(Ref, RefDb),
-            %% The file name of the entry is found by its ref
+            %% The entry is keyed by a file name or by the content
+            %% hash of a DER list, found here by its ref.
             true = ets:match_delete(FileMapDb, {'_', Ref}),
 	    ssl_pkix_db:remove_trusted_certs(Ref, CertDb);
 	_ ->
