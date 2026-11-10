@@ -99,8 +99,11 @@ find_issuer(IsIssuerFun, extracted, CertsData) ->
         {ok, _} = Result ->
             Result
     end;
-find_issuer(IsIssuerFun, Db, _) ->  
-    try ssl_pkix_db:foldl(IsIssuerFun, issuer_not_found, Db) of
+find_issuer(IsIssuerFun, Db, DbRef) ->
+    %% Db holds the trusted certs of all connections, only those of
+    %% this connection may be used
+    Entries = ssl_pkix_db:select_certentries_by_ref(DbRef, Db),
+    try lists:foldl(IsIssuerFun, issuer_not_found, Entries) of
         issuer_not_found ->
             {error, issuer_not_found}
     catch
