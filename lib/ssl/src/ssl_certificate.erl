@@ -317,17 +317,6 @@ public_key_type(Oid) ->
     {_, Sign} = public_key:pkix_sign_types(Oid),
     Sign.
 
-%%--------------------------------------------------------------------
--spec foldl_db(fun(), ssl_manager:db_handle() | {extracted, list()}, list()) ->
- {ok, term()} | issuer_not_found.
-%%
-%% Description:
-%%--------------------------------------------------------------------
-foldl_db(IsIssuerFun, CertDbHandle, []) ->
-    ssl_pkix_db:foldl(IsIssuerFun, issuer_not_found, CertDbHandle);
-foldl_db(IsIssuerFun, _, [_|_] = ListDb) ->
-    lists:foldl(IsIssuerFun, issuer_not_found, ListDb).
-
 find_cross_sign_root_paths([], _CertDbHandle, _CertDbRef, _InvalidatedList) ->
     [];
 find_cross_sign_root_paths([_ | Rest] = Path, CertDbHandle, CertDbRef, InvalidatedList) ->
@@ -509,13 +498,13 @@ find_issuer(#cert{der=DerCert, otp=OtpCert}, CertDbHandle, CertsDbRef, ListDb, I
     Result = case is_reference(CertsDbRef) of
 		 true when ListDb == [] ->
                      CertEntryList = ssl_pkix_db:select_certentries_by_ref(CertsDbRef, CertDbHandle),
-		     do_find_issuer(IsIssuerFun, CertDbHandle, CertEntryList);
+		     do_find_issuer(IsIssuerFun, CertEntryList);
 		 false when ListDb == [] ->
 		     {extracted, CertsData} = CertsDbRef,
 		     CertEntryList = [Entry || {decoded, Entry} <- CertsData],
-		     do_find_issuer(IsIssuerFun, CertDbHandle, CertEntryList);
+		     do_find_issuer(IsIssuerFun, CertEntryList);
                  _ ->
-                     do_find_issuer(IsIssuerFun, CertDbHandle, ListDb)
+                     do_find_issuer(IsIssuerFun, ListDb)
 	     end,
     case Result of
         issuer_not_found ->
@@ -525,9 +514,11 @@ find_issuer(#cert{der=DerCert, otp=OtpCert}, CertDbHandle, CertsDbRef, ListDb, I
     end.
 
 
-do_find_issuer(IssuerFun, CertDbHandle, CertDb) ->
+%% Only the given candidates are searched. When there are none, such as
+%% for a connection without trusted certs, the issuer is not found.
+do_find_issuer(IssuerFun, Candidates) ->
     try
-	foldl_db(IssuerFun, CertDbHandle, CertDb)
+	lists:foldl(IssuerFun, issuer_not_found, Candidates)
     catch
 	throw:{ok, _} = Return ->
 	    Return
