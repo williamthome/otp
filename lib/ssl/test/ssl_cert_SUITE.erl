@@ -131,6 +131,8 @@
          max_chain_depth_buildup/1,
          duplicate_issuer_in_trust_store/0,
          duplicate_issuer_in_trust_store/1,
+         same_issuer_name_other_key_type/0,
+         same_issuer_name_other_key_type/1,
          key_auth_ext_sign_only/0,
          key_auth_ext_sign_only/1,
          hello_retry_request/0,
@@ -267,7 +269,8 @@ rsa_tests() ->
     expired_root_with_cross_signed_root,
     malicious_cycle_in_peer_chain,
     max_chain_depth_buildup,
-    duplicate_issuer_in_trust_store
+    duplicate_issuer_in_trust_store,
+    same_issuer_name_other_key_type
    ].
 
 tls_1_3_rsa_tests() ->
@@ -1434,6 +1437,37 @@ max_chain_depth_buildup(Config) when is_list(Config) ->
                                           ExtractedCAs, [], encoded),
     %% MAX_CHAIN is 12: chain must not exceed that
     true = (length(Chain) =< 12).
+
+%%--------------------------------------------------------------------
+same_issuer_name_other_key_type() ->
+    [{doc, "Trusted CA certs may have the same name but keys of different "
+      "types. Building a chain must skip a candidate whose key can not "
+      "verify the signature instead of crashing, whatever order the "
+      "candidates are tried in."}].
+same_issuer_name_other_key_type(Config) when is_list(Config) ->
+    Chain = fun(Conf) ->
+                    #{server_config := Opts} =
+                        public_key:pkix_test_data(
+                          #{server_chain => #{root => Conf,
+                                              intermediates => [Conf],
+                                              peer => Conf},
+                            client_chain => #{root => Conf,
+                                              intermediates => [Conf],
+                                              peer => Conf}}),
+                    Opts
+            end,
+    EdDSAOpts = Chain(ssl_test_lib:eddsa_conf()),
+    DSAOpts = Chain([{key, ssl_test_lib:hardcode_dsa_key(1)}]),
+    Cert = proplists:get_value(cert, EdDSAOpts),
+    EdDSACAs = proplists:get_value(cacerts, EdDSAOpts),
+    %% Same CA names, DSA keys, tried first. Verifying the EdDSA
+    %% signature with a DSA key makes crypto raise badarg.
+    CAs = proplists:get_value(cacerts, DSAOpts) ++ EdDSACAs,
+    {ok, ExtractedCAs} = ssl_pkix_db:extract_trusted_certs({der, CAs}),
+    {ok, Root, [Cert | _]} =
+        ssl_certificate:certificate_chain(Cert, ets:new(foo, []),
+                                          ExtractedCAs, [], encoded),
+    true = lists:member(Root, EdDSACAs).
 
 %%--------------------------------------------------------------------
 duplicate_issuer_in_trust_store() ->
