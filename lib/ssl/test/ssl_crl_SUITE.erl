@@ -51,6 +51,8 @@
          crl_verify_revoked_derCAs/1,
          crl_verify_no_crl/0,
          crl_verify_no_crl/1,
+         crl_issuer_only_own_trusted_certs/0,
+         crl_issuer_only_own_trusted_certs/1,
          crl_hash_dir_collision/0,
          crl_hash_dir_collision/1,
          crl_hash_dir_expired/0,
@@ -82,7 +84,7 @@ groups() ->
                               {group, v1_crl},
 			      {group, idp_crl},
 			      {group, crl_hash_dir}]},
-     {v2_crl,  [], basic_tests()},
+     {v2_crl,  [], [crl_issuer_only_own_trusted_certs | basic_tests()]},
      {v1_crl,  [], basic_tests()},
      {idp_crl, [], basic_tests() ++ idp_crl_tests()},
      {crl_hash_dir, [], basic_tests() ++ crl_hash_dir_tests()},
@@ -380,6 +382,31 @@ crl_verify_revoked_derCAs(Config)  when is_list(Config) ->
 
     crl_verify_error(Hostname, ServerNode, ServerOpts, ClientNode, ClientOpts,
                      certificate_revoked).
+
+crl_issuer_only_own_trusted_certs() ->
+    [{doc,"Test that the issuer of a CRL is only searched for among the "
+      "trusted certs of the connection, as the trusted cert DB is shared "
+      "by all connections."}].
+crl_issuer_only_own_trusted_certs(Config) when is_list(Config) ->
+    PrivDir = proplists:get_value(cert_dir, Config),
+    %% The root CA that signed the CRL is trusted by another connection
+    {ok, RootPem} = file:read_file(filename:join([PrivDir, "erlangCA", "cert.pem"])),
+    [{'Certificate', RootDer, not_encrypted}] = public_key:pem_decode(RootPem),
+    Root = public_key:pkix_decode_cert(RootDer, otp),
+    {ok, CRLPem} = file:read_file(filename:join([PrivDir, "erlangCA", "crl.pem"])),
+    [{'CertificateList', CRLDer, not_encrypted}] = public_key:pem_decode(CRLPem),
+    CRL = public_key:der_decode('CertificateList', CRLDer),
+    Db = ets:new(trusted_certs, [set]),
+    OtherRef = make_ref(),
+    {ok, {SerialNumber, Issuer}} = public_key:pkix_issuer_id(Root, self),
+    true = ets:insert(Db, {{OtherRef, SerialNumber, Issuer},
+                           #cert{der = RootDer, otp = Root}}),
+    %% Not found when searching the trusted certs of this connection
+    {error, unknown_ca} =
+        ssl_crl:trusted_cert_and_path(CRL, issuer_not_found, [], {Db, make_ref()}),
+    %% Found among the trusted certs of the connection that trusts it
+    {ok, RootDer, _} =
+        ssl_crl:trusted_cert_and_path(CRL, issuer_not_found, [], {Db, OtherRef}).
 
 crl_verify_no_crl() ->
     [{doc,"Verify a simple CRL chain when the CRL is missing"}].
